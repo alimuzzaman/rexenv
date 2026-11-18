@@ -64,6 +64,7 @@ pub mod postgres;
 pub mod proc;
 pub mod prompt;
 pub mod proxy;
+pub mod public_alias;
 pub mod redis;
 pub mod repo;
 pub mod scratch;

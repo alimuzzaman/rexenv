@@ -1004,21 +1004,38 @@ where
         "site.domains" => {
             let state = app_state(app)?;
             let id = need_str(&args, "id", cmd)?;
-            let domains = match (args["add"].as_str(), args["remove"].as_str()) {
-                (Some(d), None) => {
-                    commands::sites::add_site_domain(state.clone(), id, d.to_string()).await?
+            let (add, remove) = (args["add"].as_str(), args["remove"].as_str());
+            // Public aliases (`core::public_alias`): nginx `server_name` only.
+            let (add_alias, remove_alias) = (args["addAlias"].as_str(), args["removeAlias"].as_str());
+            if [add, remove, add_alias, remove_alias].iter().filter(|v| v.is_some()).count() > 1 {
+                return Err(Error::Other(
+                    "site.domains takes one of `add`, `remove`, `addAlias`, `removeAlias`".into(),
+                ));
+            }
+            let public = if let Some(h) = add_alias {
+                Some(commands::sites::add_site_public_alias(state.clone(), id.clone(), h.to_string()).await?)
+            } else if let Some(h) = remove_alias {
+                Some(commands::sites::remove_site_public_alias(state.clone(), id.clone(), h.to_string()).await?)
+            } else {
+                None
+            };
+            let domains = match (add, remove) {
+                (Some(d), _) => {
+                    commands::sites::add_site_domain(state.clone(), id.clone(), d.to_string()).await?
                 }
                 (None, Some(d)) => {
-                    commands::sites::remove_site_domain(state.clone(), id, d.to_string()).await?
+                    commands::sites::remove_site_domain(state.clone(), id.clone(), d.to_string()).await?
                 }
-                (None, None) => commands::sites::site_domains(state.clone(), id).await?,
-                (Some(_), Some(_)) => {
-                    return Err(Error::Other(
-                        "site.domains takes `add` or `remove`, not both".into(),
-                    ))
-                }
+                (None, None) => commands::sites::site_domains(state.clone(), id.clone()).await?,
             };
-            Ok(json!({ "domains": domains, "edgeHttpsPort": commands::services::edge_ports(&state).https }))
+            let public = match public {
+                Some(p) => p,
+                None => crate::core::public_alias::for_site(state.platform.as_ref(), &id)?,
+            };
+            // `domains` lists every name the site answers on, public aliases last.
+            let mut all = domains;
+            all.extend(public.iter().cloned());
+            Ok(json!({ "domains": all, "publicAliases": public, "edgeHttpsPort": commands::services::edge_ports(&state).https }))
         }
         "site.cert" => {
             let state = app_state(app)?;

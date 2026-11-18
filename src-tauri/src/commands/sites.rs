@@ -357,6 +357,32 @@ pub async fn site_domains(state: State<'_, AppState>, id: String) -> Result<Vec<
     core::sites::all_domains(&conn, &site)
 }
 
+/// Add a public alias (`core::public_alias`): the name joins this site's nginx
+/// `server_name` only — no certificate, edge route or resolver change, so no
+/// TLD policy and no prompt. Returns the site's public aliases.
+pub async fn add_site_public_alias(state: State<'_, AppState>, id: String, host: String) -> Result<Vec<String>> {
+    let (out, sites, aliases) = {
+        let conn = lock(&state)?;
+        let out = core::public_alias::add(state.platform.as_ref(), &conn, &id, &host)?;
+        (out, core::sites::list(&conn)?, crate::state::store::all_site_aliases(&conn)?)
+    };
+    reload_for_domains(&state, sites, aliases).await?;
+    Ok(out)
+}
+
+/// Remove a public alias; a name the site does not have is not an error, and
+/// the reload still runs (the same retry rule as `remove_site_domain`).
+pub async fn remove_site_public_alias(state: State<'_, AppState>, id: String, host: String) -> Result<Vec<String>> {
+    let (out, sites, aliases) = {
+        let conn = lock(&state)?;
+        core::sites::get(&conn, &id)?.ok_or_else(|| Error::Other(format!("site not found: {id}")))?;
+        let out = core::public_alias::remove(state.platform.as_ref(), &id, &host)?;
+        (out, core::sites::list(&conn)?, crate::state::store::all_site_aliases(&conn)?)
+    };
+    reload_for_domains(&state, sites, aliases).await?;
+    Ok(out)
+}
+
 /// Mirror the new alias map into the manager and reload the web tier — the
 /// shared tail of add/remove.
 ///
@@ -1864,6 +1890,11 @@ pub(crate) async fn delete_site_owned(
         // tunnel + login mu-plugins, and the mu-plugins dir itself when it is
         // RECORDED as ours and empty again.
         core::sites::cleanup_muplugin_artifacts(&site, true);
+    }
+    // Its public aliases go with it, before the reload, so nginx stops
+    // answering on them (`core::public_alias`).
+    if let Err(e) = core::public_alias::forget_site(state.platform.as_ref(), &id) {
+        log::warn!("sites: deleted {} — its public aliases could not be forgotten: {e}", site.domain);
     }
     // Best-effort reload (no-op if services aren't running). A delete only
     // REMOVES backends, so there are no readiness probes to await.

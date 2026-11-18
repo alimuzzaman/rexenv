@@ -275,6 +275,10 @@ COMMANDS:
   site start <domain> | --all        Serve this site (or every site, --all) again
   site stop <domain> | --all         Stop serving THIS site, or every site — rexenv's services keep running
   site domains <domain> [--add N | --remove N]   Extra hostnames the site answers on
+  site domains <domain> [--add-alias N | --remove-alias N]
+                Public alias: a real public name (any TLD) that only the shared
+                nginx answers on for this site — no certificate, edge route or
+                DNS change. For a front door that forwards with that Host
   service restart <nginx|edge|php-8.3>           Bounce one web-tier service on a fresh config
   site rename <domain> <name>        Display name only (domain unchanged)
   site domain <domain> <new-domain>  Change the domain (URL rewrite; asks first)
@@ -2806,26 +2810,27 @@ fn cmd_site_server(words: &[String], json_output: bool) {
 /// One verb for read and write because it is one question from the user's side
 /// — which names does this site answer on — and the reply is always the whole
 /// list, so an add or a remove shows its own result rather than a bare "ok".
-const DOMAINS_USAGE: &str = "rex: usage: rex site domains <domain> [--add <name> | --remove <name>]";
+const DOMAINS_USAGE: &str = "rex: usage: rex site domains <domain> [--add <name> | --remove <name> | --add-alias <host> | --remove-alias <host>]";
 
 fn cmd_site_domains(words: &[String], json_output: bool) {
     // Both flags are optional and no flag means LIST, so a typo does not fail —
     // it lists. `rex site domains shop.rex --remov extra.rex` printed the
     // domains WITH `extra.rex` still among them, which reads as the state after
     // a removal rather than as a removal that never ran.
-    reject_unknown_flags(words, "site domains", &["--add", "--remove"], DOMAINS_USAGE);
+    reject_unknown_flags(words, "site domains", &["--add", "--remove", "--add-alias", "--remove-alias"], DOMAINS_USAGE);
     let site = find_site(words, DOMAINS_USAGE.trim_start_matches("rex: usage: "));
     let flag = |name: &str| {
         words.iter().position(|w| w == name).and_then(|i| words.get(i + 1)).cloned()
     };
     let (add, remove) = (flag("--add"), flag("--remove"));
-    if add.is_some() && remove.is_some() {
-        errln!("rex: pass --add or --remove, not both");
+    let (add_alias, remove_alias) = (flag("--add-alias"), flag("--remove-alias"));
+    if [&add, &remove, &add_alias, &remove_alias].iter().filter(|v| v.is_some()).count() > 1 {
+        errln!("rex: pass one of --add, --remove, --add-alias, --remove-alias");
         exit(1);
     }
     let r = request(
         "site.domains",
-        json!({ "id": site["id"], "add": add, "remove": remove }),
+        json!({ "id": site["id"], "add": add, "remove": remove, "addAlias": add_alias, "removeAlias": remove_alias }),
     );
     if json_output {
         return print_json(&r);
@@ -2834,8 +2839,16 @@ fn cmd_site_domains(words: &[String], json_output: bool) {
     // The primary is first, and saying so is the point: the extras are names
     // this site ALSO answers on, not equals of the one its files, database and
     // certificate directory are named for.
+    // Public aliases come last in `domains` and are listed bare: rexenv's edge
+    // does not serve them, so an https://…:<edge port> URL would be wrong.
+    let public: Vec<&str> = r["publicAliases"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
     for (i, d) in domains.iter().enumerate() {
-        let url = host_url(d.as_str().unwrap_or("?"), r["edgeHttpsPort"].as_u64());
+        let name = d.as_str().unwrap_or("?");
+        if public.contains(&name) {
+            outln!("{name}   (public alias: nginx only)");
+            continue;
+        }
+        let url = host_url(name, r["edgeHttpsPort"].as_u64());
         match i {
             0 => outln!("{url}   (primary)"),
             _ => outln!("{url}"),
@@ -2846,7 +2859,7 @@ fn cmd_site_domains(words: &[String], json_output: bool) {
     // only when there is an extra name to be redirected, and only for
     // WordPress: a note about a thing that cannot happen is noise, and noise is
     // how the useful notes stop being read.
-    if domains.len() > 1 && site["type"] == json!("wordpress") {
+    if domains.len() > 1 + public.len() && site["type"] == json!("wordpress") {
         let primary = domains.first().and_then(Value::as_str).unwrap_or("?");
         outln!(
             "\nnote: WordPress sends visitors to {primary} — the extra names reach this site \

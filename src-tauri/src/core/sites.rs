@@ -2931,6 +2931,15 @@ pub fn rebuild_configs_for(
     aliases: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<RebuiltConfigs> {
     let (nginx_http_port, caddy_http_port, caddy_https_port) = (ports.nginx, ports.http, ports.https);
+    // Public aliases (`core::public_alias`) join nginx's `server_name` and
+    // nothing else: the edge routes and certificates below keep `aliases`. A
+    // broken file must not take the web tier down, so it is logged and skipped.
+    let public = crate::core::public_alias::load(platform).unwrap_or_else(|e| {
+        log::warn!("public aliases not served: {e}");
+        Default::default()
+    });
+    let site_names: Vec<(&str, &str)> = sites.iter().map(|s| (s.id.as_str(), s.domain.as_str())).collect();
+    let nginx_aliases = crate::core::public_alias::merged_for_nginx(&site_names, aliases, &public);
     // Only nginx-served sites get a server block; override servers (§2/§3) have
     // their own backend process.
     let mut nginx_sites: Vec<services::NginxSite> = sites
@@ -2940,7 +2949,7 @@ pub fn rebuild_configs_for(
         // with no block at all is answered by nginx's default server, which is
         // another site (ledger #511).
         .filter(|s| gets_nginx_block(s))
-        .map(|s| nginx_site_for(s, body_limits, site_env, aliases))
+        .map(|s| nginx_site_for(s, body_limits, site_env, &nginx_aliases))
         .collect();
     // Internal Adminer vhost (§5.2): served by the default php-fpm pool, rooted at
     // its isolated docroot. Not a Site → never a tunnel origin (§9).
@@ -2991,7 +3000,7 @@ pub fn rebuild_configs_for(
             Some(services::NginxStopped {
                 domain: s.domain.clone(),
                 page_dir: stopped_pages.get(&s.id)?.clone(),
-                aliases: aliases.get(&s.id).cloned().unwrap_or_default(),
+                aliases: nginx_aliases.get(&s.id).cloned().unwrap_or_default(),
                 wildcard: matches!(s.multisite, MultisiteMode::Subdomain),
             })
         })

@@ -681,6 +681,22 @@ fn server_block(http_port: u16, site: &NginxSite) -> String {
     )
 }
 
+/// The catch-all for a Host no site names: 421 Misdirected Request on every
+/// path, no root, no PHP. `default_server` makes it nginx's choice for an unknown
+/// name whatever the block order.
+fn unknown_host_block(http_port: u16) -> String {
+    format!(
+        "\n\tserver {{\n\
+         \t\tlisten 127.0.0.1:{port} default_server;\n\
+         \t\tserver_name _;\n\
+         \t\tlocation / {{\n\
+         \t\t\treturn 421;\n\
+         \t\t}}\n\
+         \t}}\n",
+        port = http_port,
+    )
+}
+
 /// A stopped site's server block: 503 with rexenv's stopped page, for every
 /// path, and no PHP anywhere near it.
 ///
@@ -767,6 +783,10 @@ pub fn generate_nginx_config(cfg: &NginxConfig) -> String {
     ));
     // Map Caddy's X-Forwarded-Proto to an HTTPS flag for php (WordPress is_ssl()).
     s.push_str("\tmap $http_x_forwarded_proto $rexenv_https {\n\t\tdefault '';\n\t\thttps on;\n\t}\n");
+    // A Host that no block names gets 421 from this block, never a site. Without
+    // an explicit `default_server`, nginx answers it from the FIRST block, which is
+    // somebody's site (the #511 fallthrough, for names rexenv never knew at all).
+    s.push_str(&unknown_host_block(cfg.http_port));
     for site in &cfg.sites {
         s.push_str(&server_block(cfg.http_port, site));
     }
@@ -1298,8 +1318,9 @@ mod tests {
         // word (`fastcgi_param SERVER_NAME $server_name` is one too, and
         // counting it made this assertion fail for a reason unrelated to its
         // claim).
+        // The unknown-Host catch-all (`server_name _;`) is not a site's block.
         assert_eq!(
-            out.matches("\t\tserver_name ").count(),
+            out.matches("\t\tserver_name ").count() - out.matches("\t\tserver_name _;").count(),
             1,
             "one site must still be ONE server block: {out}"
         );
@@ -1316,6 +1337,26 @@ mod tests {
         assert!(
             out.contains("server_name acme.test *.acme.test shop.test *.shop.test;"),
             "a network's alias needs the wildcard, or its sub-sites hit the default server: {out}"
+        );
+    }
+
+    /// An unknown Host is refused by the one `default_server` block, which
+    /// comes before every site and has no root and no PHP.
+    #[test]
+    fn an_unknown_host_is_refused_instead_of_served_by_the_first_site() {
+        let out = generate_nginx_config(&nginx_cfg(RewriteMode::Single));
+        assert_eq!(out.matches("default_server").count(), 1, "{out}");
+        let block = out
+            .split("listen 127.0.0.1:18088 default_server;")
+            .nth(1)
+            .and_then(|b| b.split("\n\t}").next())
+            .expect("the catch-all block");
+        assert!(block.contains("server_name _;"), "{block}");
+        assert!(block.contains("return 421;"), "{block}");
+        assert!(!block.contains("root ") && !block.contains("fastcgi_pass"), "{block}");
+        assert!(
+            out.find("default_server").unwrap() < out.find("server_name acme.test;").unwrap(),
+            "{out}"
         );
     }
 
